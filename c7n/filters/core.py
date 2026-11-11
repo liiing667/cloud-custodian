@@ -43,6 +43,9 @@ class FilterValidationError(Exception):
 
 # Matching filters annotate their key onto objects
 ANNOTATION_KEY = "c7n:MatchedFilters"
+# Annotation used to surface raw tag keys which normalize to the same key but
+# carry different values.
+TAG_KEY_CONFLICT_ANNOTATION = "c7n:TagKeyConflict"
 
 
 def glob_match(value, pattern):
@@ -253,6 +256,69 @@ class BaseValueFilter(Filter):
         super(BaseValueFilter, self).__init__(data, manager)
         self.expr = {}
 
+    def _get_tag_values(self, k, i, normalize_func):
+        """Return the raw tag entries which match the requested tag key.
+
+        When normalization is enabled multiple raw keys can map to the same
+        normalized key.  Keep all of them instead of taking the first entry,
+        which makes the result depend on resource tag ordering.
+        """
+        tk = k.split(':', 1)[1]
+        tags = []
+
+        if 'Tags' in i:
+            for t in i.get("Tags", []) or ():
+                try:
+                    raw_key = t["Key"]
+                    if normalize_func:
+                        normalized_key = normalize_func(raw_key)
+                        if normalized_key != tk:
+                            continue
+                        # Preserve the historical behavior of ignoring malformed
+                        # tags when normalization is in use.
+                        value = t["Value"]
+                    elif raw_key == tk:
+                        value = t.get("Value")
+                    else:
+                        continue
+                except (AttributeError, SyntaxError, KeyError, TypeError):
+                    continue
+                tags.append({"Key": raw_key, "Value": value})
+        elif 'labels' in i:
+            tags = self._get_dict_tag_values(
+                i.get('labels', {}), tk, normalize_func)
+        elif 'tags' in i:
+            tags = self._get_dict_tag_values(
+                i.get('tags', {}) or {}, tk, normalize_func)
+
+        return tags
+
+    def _get_dict_tag_values(self, tags, tk, normalize_func):
+        values = []
+        for raw_key, value in tags.items():
+            try:
+                normalized_key = normalize_func(raw_key) if normalize_func else raw_key
+            except (AttributeError, SyntaxError, TypeError):
+                continue
+            if normalized_key == tk:
+                values.append({"Key": raw_key, "Value": value})
+        return values
+
+    def _record_tag_key_conflict(self, resource, conflict):
+        if not isinstance(resource, dict):
+            return
+        conflicts = resource.setdefault(TAG_KEY_CONFLICT_ANNOTATION, {})
+        if conflict.normalized_key in conflicts:
+            return
+        conflicts[conflict.normalized_key] = conflict.as_dict()
+        self.log.warning(
+            "Tag key normalization conflict for key %s (normalized to %s): "
+            "%s; refusing ambiguous value selection",
+            conflict.key,
+            conflict.normalized_key,
+            ", ".join(
+                "%s=%r" % (t["Key"], t["Value"]) for t in conflict.tags))
+
     def get_resource_value(self, k, i, regex=None):
         r = None
         if k.startswith('tag:'):
@@ -260,21 +326,28 @@ class BaseValueFilter(Filter):
                 self.data.get("tag_key_transforms")
             )
             tk = k.split(':', 1)[1]
-            if 'Tags' in i:
-                for t in _normalize_aws_tag_keys(i.get("Tags", []), normalize_if_needed):
-                    if t.get('Key') == tk:
-                        r = t.get('Value')
-                        break
-            # GCP schema: 'labels': {'key': 'value'}
-            elif 'labels' in i:
-                r = _normalize_tag_dict_keys(i.get('labels', {}), normalize_if_needed).get(tk, None)
-            # GCP has a secondary form of labels called tags
-            # as labels without values.
-            # Azure schema: 'tags': {'key': 'value'}
-            elif 'tags' in i:
-                r = _normalize_tag_dict_keys(i.get('tags', {}) or {}, normalize_if_needed).get(
-                    tk, None
-                )
+            if normalize_if_needed:
+                candidates = self._get_tag_values(k, i, normalize_if_needed)
+                if len(candidates) > 1 and any(
+                        t["Value"] != candidates[0]["Value"] for t in candidates):
+                    r = TagKeyConflict(k, tk, candidates)
+                    self._record_tag_key_conflict(i, r)
+                elif candidates:
+                    r = candidates[0]["Value"]
+            else:
+                # GCP schema: 'labels': {'key': 'value'}
+                if 'Tags' in i:
+                    for t in i.get("Tags", []) or ():
+                        if t.get("Key") == tk:
+                            r = t.get("Value")
+                            break
+                elif 'labels' in i:
+                    r = i.get('labels', {}).get(tk, None)
+                # GCP has a secondary form of labels called tags
+                # as labels without values.
+                # Azure schema: 'tags': {'key': 'value'}
+                elif 'tags' in i:
+                    r = (i.get('tags', {}) or {}).get(tk, None)
         elif k in i:
             r = i.get(k)
         elif k not in self.expr:
@@ -284,7 +357,10 @@ class BaseValueFilter(Filter):
             r = self.expr[k].search(i)
 
         if regex:
-            r = ValueRegex(regex).get_resource_value(r)
+            if isinstance(r, TagKeyConflict):
+                r = r.with_regex(regex)
+            else:
+                r = ValueRegex(regex).get_resource_value(r)
         return r
 
     def _validate_value_regex(self, regex):
@@ -397,6 +473,34 @@ def _normalize_tag_dict_keys(tags: dict, normalize_func) -> dict:
         except (AttributeError, SyntaxError):
             pass
     return normalized_tags
+
+
+class TagKeyConflict:
+    """Multiple raw tag keys normalize to one key with different values."""
+
+    def __init__(self, key, normalized_key, tags):
+        self.key = key
+        self.normalized_key = normalized_key
+        self.tags = tags
+
+    @property
+    def values(self):
+        return [t["Value"] for t in self.tags]
+
+    def with_regex(self, regex):
+        return TagKeyConflict(
+            self.key,
+            self.normalized_key,
+            [{"Key": t["Key"], "Value": ValueRegex(regex).get_resource_value(t["Value"])}
+             for t in self.tags])
+
+    def as_dict(self):
+        return {
+            "key": self.key,
+            "normalized_key": self.normalized_key,
+            "tags": [{"Key": t["Key"], "Value": t["Value"]} for t in self.tags],
+            "values": self.values,
+        }
 
 
 def intersect_list(a, b):
@@ -778,6 +882,9 @@ class ValueFilter(BaseValueFilter):
         if self.op in ('in', 'not-in') and r is None:
             r = ()
 
+        if isinstance(r, TagKeyConflict):
+            return self._match_tag_key_conflict(r, i)
+
         # value type conversion
         if self.vtype is not None:
             v, r = self.process_value_type(self.v, r, i)
@@ -787,6 +894,29 @@ class ValueFilter(BaseValueFilter):
         else:
             v = self.v
 
+        return self._match_value(r, v)
+
+    def _match_tag_key_conflict(self, conflict, resource):
+        """Conservatively evaluate every value of a normalized key conflict.
+
+        A conflicting key is only considered a match when all candidate
+        values agree with the filter.  If only some values match, the raw key
+        selection is ambiguous and the resource is rejected rather than
+        selecting a value based on tag ordering.
+        """
+        if self.vtype is not None:
+            values = []
+            for candidate in conflict.values:
+                v, candidate = self.process_value_type(self.v, candidate, resource)
+                if self.vtype == 'duration' and candidate is None:
+                    return False
+                values.append((candidate, v))
+        else:
+            values = [(candidate, self.v) for candidate in conflict.values]
+
+        return all(self._match_value(candidate, v) for candidate, v in values)
+
+    def _match_value(self, r, v):
         # Value match
         if r is None and v == 'absent':
             return True

@@ -19,7 +19,12 @@ from c7n.resources.elb import ELB
 from c7n.testing import mock_datetime_now
 from c7n.utils import annotation
 from .common import instance, event_data, Bag, BaseTest
-from c7n.filters.core import AnnotationSweeper, ValueRegex, parse_date as core_parse_date
+from c7n.filters.core import (
+    AnnotationSweeper,
+    TAG_KEY_CONFLICT_ANNOTATION,
+    ValueRegex,
+    parse_date as core_parse_date,
+)
 
 
 class BaseFilterTest(BaseTest):
@@ -1097,6 +1102,105 @@ class TestInstanceValue(BaseFilterTest):
         self.assertFilter({"tag:foo": "abcd"}, i, False)
         self.assertFilter(fdata, i, True)
         self.assertEqual(annotation(i, base_filters.ANNOTATION_KEY), ["tag:foo"])
+
+    def test_normalized_key_conflicts_are_order_independent(self):
+        tags = [
+            {"Key": "CostCenter", "Value": "111"},
+            {"Key": "cost_center", "Value": "222"},
+        ]
+        fdata = {
+            "type": "value",
+            "key": "tag:costcenter",
+            "tag_key_transforms": ["lower", "nounderscores"],
+            "value": "222",
+        }
+
+        for resource_tags in (tags, list(reversed(tags))):
+            i = instance(Tags=resource_tags)
+            # An ambiguous value is rejected instead of selecting whichever
+            # raw tag happens to appear first.
+            self.assertFilter(fdata, i, False)
+            self.assertIn(TAG_KEY_CONFLICT_ANNOTATION, i)
+            self.assertNotIn(base_filters.ANNOTATION_KEY, i)
+
+    def test_normalized_key_conflict_all_candidates_must_match(self):
+        tags = [
+            {"Key": "CostCenter", "Value": "111"},
+            {"Key": "cost_center", "Value": "222"},
+        ]
+        fdata = {
+            "type": "value",
+            "key": "tag:costcenter",
+            "tag_key_transforms": ["lower", "nounderscores"],
+            "op": "in",
+            "value": ["111", "222"],
+        }
+        i = instance(Tags=tags)
+        self.assertFilter(fdata, i, True)
+        self.assertEqual(annotation(i, base_filters.ANNOTATION_KEY), ["tag:costcenter"])
+
+        # A partial match remains ambiguous and must not match.
+        fdata["value"] = ["111"]
+        i = instance(Tags=tags)
+        self.assertFilter(fdata, i, False)
+
+    def test_normalized_key_conflict_presence_and_absence(self):
+        tags = [
+            {"Key": "CostCenter", "Value": "111"},
+            {"Key": "cost_center", "Value": "222"},
+        ]
+        base = {
+            "type": "value",
+            "key": "tag:costcenter",
+            "tag_key_transforms": ["lower", "nounderscores"],
+        }
+
+        i = instance(Tags=tags)
+        self.assertFilter(dict(base, value="present"), i, True)
+        i = instance(Tags=tags)
+        self.assertFilter(dict(base, value="absent"), i, False)
+
+    def test_normalized_keys_same_value_is_not_a_conflict(self):
+        tags = [
+            {"Key": "CostCenter", "Value": "111"},
+            {"Key": "cost_center", "Value": "111"},
+        ]
+        fdata = {
+            "type": "value",
+            "key": "tag:costcenter",
+            "tag_key_transforms": ["lower", "nounderscores"],
+            "value": "111",
+        }
+        i = instance(Tags=tags)
+        self.assertFilter(fdata, i, True)
+        self.assertNotIn(TAG_KEY_CONFLICT_ANNOTATION, i)
+
+    def test_normalized_key_conflict_keeps_or_and_annotations_accurate(self):
+        tags = [
+            {"Key": "CostCenter", "Value": "111"},
+            {"Key": "cost_center", "Value": "222"},
+        ]
+        tag_filter = {
+            "type": "value",
+            "key": "tag:costcenter",
+            "tag_key_transforms": ["lower", "nounderscores"],
+            "value": "111",
+        }
+
+        i = instance(Tags=tags)
+        f = filters.factory({"or": [tag_filter, {"Architecture": "x86_64"}]})
+        self.assertEqual(f.process([i]), [i])
+        self.assertEqual(
+            annotation(i, base_filters.ANNOTATION_KEY), ["Architecture"])
+
+        i = instance(Tags=tags)
+        all_candidates_filter = dict(tag_filter, op="in", value=["111", "222"])
+        f = filters.factory(
+            {"and": [all_candidates_filter, {"Architecture": "x86_64"}]})
+        self.assertEqual(f.process([i]), [i])
+        self.assertEqual(
+            annotation(i, base_filters.ANNOTATION_KEY),
+            ["tag:costcenter", "Architecture"])
 
 
 class TestEqualValue(unittest.TestCase):
